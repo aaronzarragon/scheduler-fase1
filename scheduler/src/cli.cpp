@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <algorithm>
+#include <filesystem>
 
 // ============================================================
 // cli.cpp — Hilo de consola interactiva
@@ -43,12 +44,31 @@ static bool isNonNegInt(const std::string& s, int& out) {
     } catch (...) { return false; }
 }
 
+// Quita espacios y tabulaciones al inicio y al final
+static std::string trim(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t");
+    return s.substr(a, b - a + 1);
+}
+
+// Divide una línea por comas y recorta cada campo
+static std::vector<std::string> splitCSV(const std::string& line) {
+    std::vector<std::string> fields;
+    std::string field;
+    std::istringstream ss(line);
+    while (std::getline(ss, field, ',')) fields.push_back(trim(field));
+    if (!line.empty() && line.back() == ',') fields.push_back(""); // coma final = campo vacío
+    return fields;
+}
+
 // ---- Implementación de cada comando -------------------------
 
 // create <nombre> <burst> [prioridad]
 static void cmdCreate(const std::vector<std::string>& t) {
     if (t.size() < 3 || t.size() > 4) {
-        std::cout << "[ERROR DE SINTAXIS]: Parámetros insuficientes.\n"
+        std::cout << "[ERROR DE SINTAXIS]: "
+                  << (t.size() < 3 ? "Parámetros insuficientes.\n" : "Demasiados parámetros.\n")
                   << "Uso correcto: create <nombre> <burst_time> [prioridad]\n";
         return;
     }
@@ -96,52 +116,94 @@ static void cmdLoad(const std::vector<std::string>& t) {
         return;
     }
     std::string path = t[1];
+
+    // Validar existencia: debe ser un archivo regular (no una carpeta)
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        std::cout << "[ERROR]: El archivo no existe: " << path << "\n";
+        return;
+    }
+    if (!std::filesystem::is_regular_file(path, ec)) {
+        std::cout << "[ERROR]: La ruta no es un archivo: " << path << "\n";
+        return;
+    }
     std::ifstream file(path);
     if (!file.is_open()) {
         std::cout << "[ERROR]: No se puede abrir el archivo: " << path << "\n";
         return;
     }
 
-    int loaded = 0;
+    // Fase 1: validar TODO el archivo antes de insertar procesos.
+    // Formato por línea: NOMBRE, BURST_TIME, PRIORIDAD, ARRIVAL_TIME
+    struct Entry { std::string name; int burst, prio, arrival; };
+    std::vector<Entry> entries;
+    int errors = 0;
+    int line_no = 0;
     std::string line;
     while (std::getline(file, line)) {
-        // Ignorar comentarios y líneas vacías
-        if (line.empty() || line[0] == '#') continue;
-        // Reemplazar comas por espacios para parsear
-        for (char& c : line) if (c == ',') c = ' ';
-        std::istringstream ss(line);
-        std::string name;
-        int burst, prio, arrival;
-        if (!(ss >> name >> burst >> prio >> arrival)) {
-            std::cout << "[AVISO]: Línea ignorada (formato inválido): " << line << "\n";
-            continue;
-        }
-        if (burst <= 0 || prio < 1 || prio > 5 || arrival < 0) {
-            std::cout << "[AVISO]: Línea ignorada (valores fuera de rango): " << line << "\n";
-            continue;
-        }
+        line_no++;
+        if (line_no == 1 && line.rfind("\xEF\xBB\xBF", 0) == 0) line.erase(0, 3); // BOM UTF-8 (Bloc de notas)
+        if (!line.empty() && line.back() == '\r') line.pop_back(); // archivos con fin de línea Windows
+        std::string trimmed = trim(line);
+        if (trimmed.empty() || trimmed[0] == '#') continue;        // vacía o comentario
 
-        pthread_mutex_lock(&g_mutex);
+        std::vector<std::string> f = splitCSV(trimmed);
+        Entry e;
+        std::string why;
+        if (f.size() != 4)
+            why = "se esperaban 4 campos (NOMBRE, BURST_TIME, PRIORIDAD, ARRIVAL_TIME) y hay " + std::to_string(f.size());
+        else if (f[0].empty() || f[0].find_first_of(" \t") != std::string::npos)
+            why = "NOMBRE no puede estar vacío ni tener espacios";
+        else if (!isPositiveInt(f[1], e.burst))
+            why = "BURST_TIME debe ser un entero > 0";
+        else if (!isNonNegInt(f[2], e.prio) || e.prio < 1 || e.prio > 5)
+            why = "PRIORIDAD debe ser un entero entre 1 y 5";
+        else if (!isNonNegInt(f[3], e.arrival))
+            why = "ARRIVAL_TIME debe ser un entero >= 0";
+
+        if (!why.empty()) {
+            std::cout << "[ERROR DE FORMATO]: Línea " << line_no << ": " << why << ".\n";
+            errors++;
+            continue;
+        }
+        e.name = f[0];
+        entries.push_back(e);
+    }
+
+    if (errors > 0) {
+        std::cout << "[ERROR]: El archivo tiene " << errors
+                  << " línea(s) inválida(s). No se cargó ningún proceso.\n";
+        return;
+    }
+    if (entries.empty()) {
+        std::cout << "[ERROR]: El archivo no contiene procesos.\n";
+        return;
+    }
+
+    // Fase 2: insertar todos los procesos en una sola sección crítica,
+    // para que el motor nunca vea el lote a medias.
+    pthread_mutex_lock(&g_mutex);
+    for (const auto& e : entries) {
         PCB p;
         p.pid             = g_next_pid++;
-        p.name            = name;
-        p.burst_initial   = burst;
-        p.burst_remaining = burst;
-        p.priority        = prio;
-        p.arrival_time    = arrival;
+        p.name            = e.name;
+        p.burst_initial   = e.burst;
+        p.burst_remaining = e.burst;
+        p.priority        = e.prio;
+        p.arrival_time    = e.arrival;
         // Si su arrival_time ya llegó, entra directo a READY;
         // si no, queda en NEW y el scheduler lo pasará a READY en arrival_time.
-        if (arrival <= g_clock) {
+        if (e.arrival <= g_clock) {
             p.state = ProcessState::READY;
             g_ready_queue.push_back(p.pid);
         } else {
             p.state = ProcessState::NEW;
         }
         g_processes.push_back(p);
-        pthread_mutex_unlock(&g_mutex);
-        loaded++;
     }
-    std::cout << "[OK] " << loaded << " proceso(s) cargado(s) desde " << path << "\n";
+    pthread_mutex_unlock(&g_mutex);
+
+    std::cout << "[OK] " << entries.size() << " proceso(s) cargado(s) desde " << path << "\n";
 }
 
 // ps
@@ -230,19 +292,21 @@ static void cmdSetSched(const std::vector<std::string>& t) {
         std::cout << "[ERROR DE PARAMETRO]: Algoritmo no reconocido. Algoritmos válidos: RR, SRTF.\n";
         return;
     }
-    int q = 2;
+    int q = 2; // quantum por defecto para RR
     if (t.size() == 3) {
+        if (algo == "SRTF") {
+            std::cout << "[ERROR DE SINTAXIS]: SRTF no usa quantum. Uso correcto: set_sched SRTF\n";
+            return;
+        }
         if (!isPositiveInt(t[2], q)) {
             std::cout << "[ERROR DE TIPO]: quantum debe ser un entero > 0.\n";
             return;
         }
-    } else if (algo == "RR") {
-        // quantum obligatorio para RR pero usamos defecto 2
     }
 
     pthread_mutex_lock(&g_mutex);
-    g_algo    = (algo == "RR") ? SchedAlgo::RR : SchedAlgo::SRTF;
-    g_quantum = q;
+    g_algo = (algo == "RR") ? SchedAlgo::RR : SchedAlgo::SRTF;
+    if (algo == "RR") g_quantum = q; // SRTF conserva el quantum anterior
     pthread_mutex_unlock(&g_mutex);
 
     std::cout << "[OK] Algoritmo configurado: " << algo
@@ -286,8 +350,9 @@ static void cmdPause(const std::vector<std::string>& t) {
     }
     pthread_mutex_lock(&g_mutex);
     g_running = false;
+    int tick = g_clock;   // leer el reloj dentro de la sección crítica
     pthread_mutex_unlock(&g_mutex);
-    std::cout << "[OK] Motor de scheduling pausado. (tick=" << g_clock << ")\n";
+    std::cout << "[OK] Motor de scheduling pausado. (tick=" << tick << ")\n";
 }
 
 // gantt
@@ -401,7 +466,15 @@ void* cliThread(void* /*arg*/) {
         else if (cmd == "pause")     cmdPause(tokens);
         else if (cmd == "gantt")     cmdGantt(tokens);
         else if (cmd == "stats")     cmdStats(tokens);
-        else if (cmd == "help")      cmdHelp();
+        else if (cmd == "help") {
+            if (tokens.size() != 1)
+                std::cout << "[ERROR DE SINTAXIS]: El comando help no acepta argumentos.\n";
+            else
+                cmdHelp();
+        }
+        else if (cmd == "exit" && tokens.size() != 1) {
+            std::cout << "[ERROR DE SINTAXIS]: El comando exit no acepta argumentos.\n";
+        }
         else if (cmd == "exit") {
             std::cout << "[OK] Cerrando simulación. Liberando recursos...\n";
             pthread_mutex_lock(&g_mutex);
