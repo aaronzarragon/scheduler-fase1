@@ -1,0 +1,2 @@
+# Todo el texto con saltos de línea LF (se compila en Linux/WSL)
+* text=auto eol=lf

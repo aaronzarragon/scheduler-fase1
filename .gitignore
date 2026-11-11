@@ -1,0 +1,11 @@
+# Binarios y objetos de compilación
+*.o
+*.exe
+scheduler/scheduler
+
+# Configuración local del editor (cada uno tiene la suya)
+.vscode/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
