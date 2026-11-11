@@ -129,7 +129,14 @@ static void cmdLoad(const std::vector<std::string>& t) {
         p.burst_remaining = burst;
         p.priority        = prio;
         p.arrival_time    = arrival;
-        p.state           = ProcessState::NEW; // el scheduler lo pasará a READY en arrival_time
+        // Si su arrival_time ya llegó, entra directo a READY;
+        // si no, queda en NEW y el scheduler lo pasará a READY en arrival_time.
+        if (arrival <= g_clock) {
+            p.state = ProcessState::READY;
+            g_ready_queue.push_back(p.pid);
+        } else {
+            p.state = ProcessState::NEW;
+        }
         g_processes.push_back(p);
         pthread_mutex_unlock(&g_mutex);
         loaded++;

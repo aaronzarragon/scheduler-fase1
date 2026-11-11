@@ -78,6 +78,17 @@ void* schedulerThread(void* /*arg*/) {
         // 3. Tick de CPU ----------------------------------------
         pthread_mutex_lock(&g_mutex);
 
+        // 3.0 Si hay procesos y todos ya terminaron, no hay trabajo pendiente:
+        //     el reloj se congela para no acumular IDLE al final del Gantt
+        //     (eso distorsionaría el diagrama y el % de uso de CPU).
+        //     Si no hay ningún proceso, el reloj avanza en IDLE (ver guía, 'start').
+        if (!g_processes.empty() &&
+            countFinished() == (int)g_processes.size()) {
+            pthread_mutex_unlock(&g_mutex);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
         // 3a. Revisar si llegan procesos del batch en este tick
         for (auto& p : g_processes) {
             if (p.state == ProcessState::NEW && p.arrival_time <= g_clock) {
