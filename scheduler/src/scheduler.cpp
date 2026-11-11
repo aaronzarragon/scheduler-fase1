@@ -10,6 +10,10 @@
 // Ejecuta en su propio hilo POSIX (schedulerThread).
 // ============================================================
 
+// Intervalo de sondeo cuando el motor está pausado o sin trabajo pendiente:
+// corto, para que start/create surtan efecto casi de inmediato.
+static const int IDLE_POLL_MS = 20;
+
 // Selecciona el PID con menor ráfaga restante (SRTF)
 static int selectSRTF() {
     int best_pid = -1;
@@ -54,6 +58,57 @@ static void ganttRecord(int tick_start, int tick_end, const std::string& label) 
     }
 }
 
+// Quita todas las apariciones de un PID de la cola READY
+static void removeFromQueue(int pid) {
+    g_ready_queue.erase(std::remove(g_ready_queue.begin(), g_ready_queue.end(), pid),
+                        g_ready_queue.end());
+}
+
+// Despacho (llamar con g_mutex tomado):
+//   1. Admite los procesos NEW cuyo arrival_time ya llegó (pasan a READY).
+//   2. SRTF: desapropia al proceso actual si hay uno READY con menor ráfaga.
+//   3. Si la CPU está libre, elige el siguiente según la política activa.
+// Es idempotente: llamarla dos veces seguidas en el mismo tick no cambia nada.
+// Se llama al inicio de cada tick y también al final, para que entre ticks
+// el proceso elegido ya se vea como RUNNING en ps/pcb.
+static void dispatch(int& current_pid, int& rr_ticks) {
+    // 1. Llegadas del batch
+    for (auto& p : g_processes) {
+        if (p.state == ProcessState::NEW && p.arrival_time <= g_clock) {
+            p.state = ProcessState::READY;
+            removeFromQueue(p.pid);
+            g_ready_queue.push_back(p.pid);
+        }
+    }
+
+    // 2. Desapropiación SRTF
+    if (g_algo == SchedAlgo::SRTF && current_pid != -1) {
+        PCB* cur = findPCB(current_pid);
+        int  best_other = selectSRTF(); // mejor READY (no incluye RUNNING)
+        if (best_other != -1) {
+            PCB* other = findPCB(best_other);
+            if (cur && other && other->burst_remaining < cur->burst_remaining) {
+                cur->state = ProcessState::READY;
+                removeFromQueue(cur->pid);
+                g_ready_queue.push_back(cur->pid);
+                current_pid = -1;
+                rr_ticks = 0;
+            }
+        }
+    }
+
+    // 3. Elegir proceso si la CPU está libre
+    if (current_pid == -1) {
+        int pid = selectNext();
+        if (pid != -1) {
+            findPCB(pid)->state = ProcessState::RUNNING;
+            removeFromQueue(pid); // con cualquier política, para no dejar PIDs viejos en la cola
+            current_pid = pid;
+            rr_ticks = 0;
+        }
+    }
+}
+
 void* schedulerThread(void* /*arg*/) {
     int rr_ticks = 0;      // ticks ejecutados del quantum actual
     int current_pid = -1;  // PID en ejecución ahora
@@ -71,7 +126,7 @@ void* schedulerThread(void* /*arg*/) {
         pthread_mutex_unlock(&g_mutex);
 
         if (!is_running) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(IDLE_POLL_MS));
             continue;
         }
 
@@ -85,60 +140,22 @@ void* schedulerThread(void* /*arg*/) {
         if (!g_processes.empty() &&
             countFinished() == (int)g_processes.size()) {
             pthread_mutex_unlock(&g_mutex);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(IDLE_POLL_MS));
             continue;
         }
 
-        // 3a. Revisar si llegan procesos del batch en este tick
-        for (auto& p : g_processes) {
-            if (p.state == ProcessState::NEW && p.arrival_time <= g_clock) {
-                p.state = ProcessState::READY;
-                // Para RR: agregar a la cola si no está
-                bool in_q = false;
-                for (int id : g_ready_queue) if (id == p.pid) { in_q = true; break; }
-                if (!in_q) g_ready_queue.push_back(p.pid);
-            }
-        }
-
-        // 3b. SRTF: si hay un proceso corriendo con más BT que otro en READY → desapropiación
-        if (g_algo == SchedAlgo::SRTF && current_pid != -1) {
-            PCB* cur = findPCB(current_pid);
-            int  best_other = selectSRTF(); // mejor READY (no incluye RUNNING)
-            if (best_other != -1 && best_other != current_pid) {
-                PCB* other = findPCB(best_other);
-                if (cur && other && other->burst_remaining < cur->burst_remaining) {
-                    // Desapropiación
-                    cur->state = ProcessState::READY;
-                    g_ready_queue.push_back(cur->pid);
-                    current_pid = -1;
-                    rr_ticks = 0;
-                }
-            }
-        }
-
-        // 3c. Elegir proceso si no hay ninguno corriendo
-        if (current_pid == -1) {
-            int pid = selectNext();
-            if (pid != -1) {
-                PCB* p = findPCB(pid);
-                p->state = ProcessState::RUNNING;
-                if (p->start_time == -1) p->start_time = g_clock;
-                current_pid = pid;
-                rr_ticks = 0;
-                // Remover de g_ready_queue si RR
-                if (g_algo == SchedAlgo::RR) {
-                    for (auto it = g_ready_queue.begin(); it != g_ready_queue.end(); ++it) {
-                        if (*it == pid) { g_ready_queue.erase(it); break; }
-                    }
-                }
-            }
-        }
+        // 3a-3c. Llegadas, desapropiación y elección del proceso
+        //        (cubre procesos creados/cargados o cambios de algoritmo
+        //        hechos por la CLI mientras el motor dormía o estaba pausado)
+        dispatch(current_pid, rr_ticks);
 
         // 3d. Ejecutar un tick
         int tick_now = g_clock;
         if (current_pid != -1) {
             PCB* p = findPCB(current_pid);
             if (p) {
+                // RT: se registra cuando el proceso consume su primer tick real
+                if (p->start_time == -1) p->start_time = tick_now;
                 p->burst_remaining--;
                 rr_ticks++;
                 ganttRecord(tick_now, tick_now + 1, p->name);
@@ -157,6 +174,7 @@ void* schedulerThread(void* /*arg*/) {
                 // ¿Se acabó el quantum (RR)?
                 else if (g_algo == SchedAlgo::RR && rr_ticks >= g_quantum) {
                     p->state = ProcessState::READY;
+                    removeFromQueue(p->pid);
                     g_ready_queue.push_back(p->pid);
                     current_pid = -1;
                     rr_ticks = 0;
@@ -168,6 +186,10 @@ void* schedulerThread(void* /*arg*/) {
         }
 
         g_clock++;
+
+        // 3e. Despacho para el siguiente tick: así, mientras el motor duerme,
+        //     ps/pcb ya muestran como RUNNING al proceso que tiene la CPU.
+        dispatch(current_pid, rr_ticks);
 
         int speed = g_speed_ms;
         pthread_mutex_unlock(&g_mutex);
